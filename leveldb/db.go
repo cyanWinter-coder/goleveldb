@@ -72,6 +72,10 @@ type DB struct {
 	writeDelayN  int
 	tr           *Transaction
 
+	// Idempotent batch commit registry.
+	batchCommitMu sync.Mutex
+	batchCommits  map[uint64]*batchCommit
+
 	// Compaction.
 	compCommitLk     sync.Mutex
 	tcompCmdC        chan cCmd
@@ -104,6 +108,7 @@ func openDB(s *session) (*DB, error) {
 		snapsList: list.New(),
 		// Write
 		batchPool:    sync.Pool{New: newBatch},
+		batchCommits: make(map[uint64]*batchCommit),
 		writeMergeC:  make(chan writeMerge),
 		writeMergedC: make(chan bool),
 		writeLockC:   make(chan struct{}, 1),
@@ -603,8 +608,12 @@ func (db *DB) recoverJournal() error {
 					return errors.SetFd(err, fd)
 				}
 
-				// Save sequence number.
-				db.seq = batchSeq + uint64(batchLen)
+				// Save sequence number. batchSeq is the sequence number
+				// assigned to the first record of the batch, so the last
+				// used sequence number is batchSeq + batchLen - 1.
+				if batchLen > 0 {
+					db.seq = batchSeq + uint64(batchLen) - 1
+				}
 
 				// Flush it if large enough.
 				if mdb.Size() >= writeBuffer {
@@ -743,8 +752,12 @@ func (db *DB) recoverJournalRO() error {
 					return errors.SetFd(err, fd)
 				}
 
-				// Save sequence number.
-				db.seq = batchSeq + uint64(batchLen)
+				// Save sequence number. batchSeq is the sequence number
+				// assigned to the first record of the batch, so the last
+				// used sequence number is batchSeq + batchLen - 1.
+				if batchLen > 0 {
+					db.seq = batchSeq + uint64(batchLen) - 1
+				}
 			}
 
 			fr.Close()
@@ -1228,6 +1241,9 @@ func (db *DB) Close() error {
 
 	// Clear memdbs.
 	db.clearMems()
+
+	// Release recorded batch commits.
+	db.clearBatchCommits()
 
 	return err
 }

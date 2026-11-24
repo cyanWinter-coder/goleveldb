@@ -137,6 +137,122 @@ type writeMerge struct {
 	key, value []byte
 }
 
+// batchCommit records the state of a batch commit, identified by the batch
+// commit identity (see Batch.CommitID). It makes a batch commit idempotent:
+// a retried or replayed commit reuses the recorded sequence number and
+// result instead of being applied again with a freshly generated sequence
+// number.
+type batchCommit struct {
+	seq     uint64 // sequence number assigned to the first record of the batch
+	applied bool   // whether the batch has been applied to the memdb
+	err     error  // commit result
+}
+
+func (db *DB) getBatchCommit(id uint64) (batchCommit, bool) {
+	db.batchCommitMu.Lock()
+	defer db.batchCommitMu.Unlock()
+	c, ok := db.batchCommits[id]
+	if !ok {
+		return batchCommit{}, false
+	}
+	return *c, true
+}
+
+func (db *DB) registerBatchCommit(id uint64, c *batchCommit) {
+	db.batchCommitMu.Lock()
+	if db.batchCommits == nil {
+		db.batchCommits = make(map[uint64]*batchCommit)
+	}
+	db.batchCommits[id] = c
+	db.batchCommitMu.Unlock()
+}
+
+// finishBatchCommit marks the commit as applied, with the given result.
+func (db *DB) finishBatchCommit(id uint64, err error) {
+	db.batchCommitMu.Lock()
+	if c, ok := db.batchCommits[id]; ok {
+		c.applied = true
+		c.err = err
+	}
+	db.batchCommitMu.Unlock()
+}
+
+// failBatchCommit records a commit failure. The batch is already journaled,
+// so a retried commit will replay it with its original sequence number.
+func (db *DB) failBatchCommit(id uint64, err error) {
+	db.batchCommitMu.Lock()
+	if c, ok := db.batchCommits[id]; ok {
+		c.err = err
+	}
+	db.batchCommitMu.Unlock()
+}
+
+// clearBatchCommits releases all recorded batch commits. Used by DB.Close.
+func (db *DB) clearBatchCommits() {
+	db.batchCommitMu.Lock()
+	db.batchCommits = nil
+	db.batchCommitMu.Unlock()
+}
+
+// replayBatchCommit completes an interrupted batch commit: the batch was
+// journaled with its original sequence number but hasn't been applied to
+// the memdb. The batch is replayed with its recorded sequence number and
+// content; no new sequence number is generated.
+func (db *DB) replayBatchCommit(batch *Batch, id uint64) error {
+	// Acquire write lock.
+	select {
+	case db.writeLockC <- struct{}{}:
+		// Write lock acquired.
+	case err := <-db.compPerErrC:
+		// Compaction error.
+		return err
+	case <-db.closeC:
+		// Closed
+		return ErrClosed
+	}
+
+	c, ok := db.getBatchCommit(id)
+	if !ok {
+		// The commit record is gone; this can only happen when the DB is
+		// being closed.
+		<-db.writeLockC
+		return ErrClosed
+	}
+	var err error
+	if c.applied {
+		// Another goroutine completed the commit meanwhile.
+		err = c.err
+	} else {
+		err = db.replayBatchCommitLocked(batch, id, c.seq)
+	}
+	<-db.writeLockC
+	return err
+}
+
+// replayBatchCommitLocked replays a journaled batch into the memdb with its
+// recorded sequence number. The write lock must be held.
+func (db *DB) replayBatchCommitLocked(batch *Batch, id uint64, seq uint64) error {
+	mdb, _, err := db.flush(batch.internalLen)
+	if err != nil {
+		return err
+	}
+	defer mdb.decref()
+
+	if err := batch.putMem(seq, mdb.DB); err != nil {
+		db.failBatchCommit(id, err)
+		return err
+	}
+
+	// Advance the sequence number past the replayed batch; it may already
+	// be beyond it if other batches were committed meanwhile.
+	if nseq := seq + uint64(batch.Len()) - 1; nseq > db.seq {
+		db.setSeq(nseq)
+	}
+	atomic.StoreUint64(&batch.commitSeq, seq)
+	db.finishBatchCommit(id, nil)
+	return nil
+}
+
 func (db *DB) unlockWrite(overflow bool, merged int, err error) {
 	for i := 0; i < merged; i++ {
 		db.writeAckC <- err
@@ -152,6 +268,27 @@ func (db *DB) unlockWrite(overflow bool, merged int, err error) {
 
 // ourBatch is batch that we can modify.
 func (db *DB) writeLocked(batch, ourBatch *Batch, merge, sync bool) error {
+	// Idempotent commit: if the batch carries a commit identity and a
+	// commit with the same identity has been recorded, don't apply the
+	// batch again; complete or return the recorded commit instead.
+	if id := batch.getCommitID(); id != 0 {
+		if c, ok := db.getBatchCommit(id); ok {
+			var err error
+			if c.applied {
+				// Duplicate commit; return the recorded result without
+				// re-applying the batch.
+				err = c.err
+			} else {
+				// The previous commit was interrupted after the batch had
+				// been journaled but before it was applied to the memdb.
+				// Replay the batch with its original sequence number.
+				err = db.replayBatchCommitLocked(batch, id, c.seq)
+			}
+			db.unlockWrite(false, 0, nil)
+			return err
+		}
+	}
+
 	// Try to flush memdb. This method would also trying to throttle writes
 	// if it is too fast and compaction cannot catch-up.
 	mdb, mdbFree, err := db.flush(batch.internalLen)
@@ -185,6 +322,16 @@ func (db *DB) writeLocked(batch, ourBatch *Batch, merge, sync bool) error {
 			select {
 			case incoming := <-db.writeMergeC:
 				if incoming.batch != nil {
+					// Idempotent commit: don't merge a batch that was
+					// already committed; acknowledge it with the
+					// recorded result instead.
+					if id := incoming.batch.getCommitID(); id != 0 {
+						if c, ok := db.getBatchCommit(id); ok {
+							db.writeMergedC <- true
+							db.writeAckC <- c.err
+							continue
+						}
+					}
 					// Merge batch.
 					if incoming.batch.internalLen > mergeLimit {
 						overflow = true
@@ -233,12 +380,41 @@ func (db *DB) writeLocked(batch, ourBatch *Batch, merge, sync bool) error {
 		return err
 	}
 
-	// Put batches.
-	for _, batch := range batches {
-		if err := batch.putMem(seq, mdb.DB); err != nil {
-			panic(err)
+	// Register commit identities. The batches are now durable, so a
+	// retried commit with the same identity will reuse these sequence
+	// numbers instead of generating new ones.
+	var commitIDs []uint64
+	{
+		bseq := seq
+		for i, b := range batches {
+			if id := b.getCommitID(); id != 0 {
+				if commitIDs == nil {
+					commitIDs = make([]uint64, len(batches))
+				}
+				db.registerBatchCommit(id, &batchCommit{seq: bseq})
+				commitIDs[i] = id
+			}
+			bseq += uint64(b.Len())
 		}
-		seq += uint64(batch.Len())
+	}
+
+	// Put batches.
+	for i, b := range batches {
+		if err := b.putMem(seq, mdb.DB); err != nil {
+			// The batch is already journaled; record the failure so that
+			// a retried commit will replay the batch with its original
+			// sequence number instead of committing it again.
+			if commitIDs != nil && commitIDs[i] != 0 {
+				db.failBatchCommit(commitIDs[i], err)
+			}
+			db.unlockWrite(overflow, merged, err)
+			return err
+		}
+		if commitIDs != nil && commitIDs[i] != 0 {
+			db.finishBatchCommit(commitIDs[i], nil)
+		}
+		atomic.StoreUint64(&b.commitSeq, seq)
+		seq += uint64(b.Len())
 	}
 
 	// Incr seq number.
@@ -261,11 +437,31 @@ func (db *DB) writeLocked(batch, ourBatch *Batch, merge, sync bool) error {
 // batch is small enough, write will try to merge the batches. Set NoWriteMerge
 // option to true to disable write merge.
 //
+// If the batch carries a commit identity (see Batch.CommitID) the commit is
+// idempotent: retrying Write with the same batch after a failure reuses the
+// originally assigned sequence number and content, and a duplicate commit
+// returns the completed result without applying the batch again.
+//
 // It is safe to modify the contents of the arguments after Write returns but
 // not before. Write will not modify content of the batch.
 func (db *DB) Write(batch *Batch, wo *opt.WriteOptions) error {
 	if err := db.ok(); err != nil || batch == nil || batch.Len() == 0 {
 		return err
+	}
+
+	// Idempotent commit: if the batch carries a commit identity and a
+	// commit with the same identity has been recorded, don't apply the
+	// batch again; complete or return the recorded commit instead.
+	if id := batch.getCommitID(); id != 0 {
+		if c, ok := db.getBatchCommit(id); ok {
+			if c.applied {
+				// Duplicate commit; return the recorded result.
+				return c.err
+			}
+			// The previous commit was interrupted after the batch had
+			// been journaled but before it was applied to the memdb.
+			return db.replayBatchCommit(batch, id)
+		}
 	}
 
 	// If the batch size is larger than write buffer, it may justified to write
@@ -280,7 +476,16 @@ func (db *DB) Write(batch *Batch, wo *opt.WriteOptions) error {
 			tr.Discard()
 			return err
 		}
-		return tr.Commit()
+		// Sequence number assigned to the first record of the batch.
+		commitSeq := tr.seq - uint64(batch.Len()) + 1
+		if err := tr.Commit(); err != nil {
+			return err
+		}
+		if id := batch.getCommitID(); id != 0 {
+			db.registerBatchCommit(id, &batchCommit{seq: commitSeq, applied: true})
+			atomic.StoreUint64(&batch.commitSeq, commitSeq)
+		}
+		return nil
 	}
 
 	merge := !wo.GetNoWriteMerge() && !db.s.o.GetNoWriteMerge()

@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync/atomic"
 
 	"github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/syndtr/goleveldb/leveldb/memdb"
@@ -60,6 +61,10 @@ func (index batchIndex) v(data []byte) []byte {
 
 // Batch is a write batch.
 type Batch struct {
+	// Commit identity. Need 64-bit alignment.
+	commitID  uint64
+	commitSeq uint64
+
 	data  []byte
 	index []batchIndex
 
@@ -71,6 +76,60 @@ type Batch struct {
 	//
 	// batchGrowLimit is used as the default threshold if it's not configured.
 	growLimit int
+}
+
+// lastBatchCommitID generates process-wide unique batch commit identities.
+var lastBatchCommitID uint64
+
+// CommitID returns the stable commit identity of the batch, allocating one
+// on the first call. The commit identity makes the batch commit idempotent:
+// if Write fails after the batch has been journaled (e.g. the memdb apply
+// was interrupted), retrying Write with the same batch will replay the batch
+// with its originally assigned sequence number and content instead of
+// generating a new one, and a duplicate commit returns the completed result
+// without applying the batch again.
+//
+// The commit identity is bound to the batch content: modifying the batch
+// (Put, Delete, Reset or Load) invalidates the identity.
+//
+// The returned identity is unique within the process; it is never reused,
+// so it is safe to rely on it across DB sessions. Commit records are held
+// in memory and are released when the DB is closed.
+func (b *Batch) CommitID() uint64 {
+	if id := atomic.LoadUint64(&b.commitID); id != 0 {
+		return id
+	}
+	id := atomic.AddUint64(&lastBatchCommitID, 1)
+	if !atomic.CompareAndSwapUint64(&b.commitID, 0, id) {
+		id = atomic.LoadUint64(&b.commitID)
+	}
+	return id
+}
+
+// getCommitID returns the commit identity of the batch, or zero if the
+// batch doesn't carry one.
+func (b *Batch) getCommitID() uint64 {
+	return atomic.LoadUint64(&b.commitID)
+}
+
+// CommitSeq returns the sequence number assigned to the first record of the
+// batch when it was committed. It returns zero if the batch hasn't been
+// committed yet.
+func (b *Batch) CommitSeq() uint64 {
+	return atomic.LoadUint64(&b.commitSeq)
+}
+
+// Committed reports whether the batch has been committed.
+func (b *Batch) Committed() bool {
+	return b.CommitSeq() != 0
+}
+
+// invalidateCommit clears the commit identity; it is called whenever the
+// batch content changes, so that a modified batch is never mistaken for a
+// duplicate of its previous content.
+func (b *Batch) invalidateCommit() {
+	atomic.StoreUint64(&b.commitID, 0)
+	atomic.StoreUint64(&b.commitSeq, 0)
 }
 
 func (b *Batch) grow(n int) {
@@ -91,6 +150,7 @@ func (b *Batch) grow(n int) {
 }
 
 func (b *Batch) appendRec(kt keyType, key, value []byte) {
+	b.invalidateCommit()
 	n := 1 + binary.MaxVarintLen32 + len(key)
 	if kt == keyTypeVal {
 		n += binary.MaxVarintLen32 + len(value)
@@ -143,6 +203,7 @@ func (b *Batch) Dump() []byte {
 // The given slice will not be copied and will be used as batch buffer, so
 // it is not safe to modify the contents of the slice.
 func (b *Batch) Load(data []byte) error {
+	b.invalidateCommit()
 	return b.decode(data, -1)
 }
 
@@ -164,11 +225,13 @@ func (b *Batch) Len() int {
 	return len(b.index)
 }
 
-// Reset resets the batch.
+// Reset resets the batch. This also cancels the batch commit identity, so
+// that a reused batch will not be mistaken for a duplicate commit.
 func (b *Batch) Reset() {
 	b.data = b.data[:0]
 	b.index = b.index[:0]
 	b.internalLen = 0
+	b.invalidateCommit()
 }
 
 func (b *Batch) replayInternal(fn func(i int, kt keyType, k, v []byte) error) error {
@@ -181,6 +244,7 @@ func (b *Batch) replayInternal(fn func(i int, kt keyType, k, v []byte) error) er
 }
 
 func (b *Batch) append(p *Batch) {
+	b.invalidateCommit()
 	ob := len(b.data)
 	oi := len(b.index)
 	b.data = append(b.data, p.data...)
@@ -323,24 +387,17 @@ func decodeBatchToMem(data []byte, expectSeq uint64, mdb *memdb.DB) (seq uint64,
 	if seq < expectSeq {
 		return 0, 0, newErrBatchCorrupted("invalid sequence number")
 	}
-	data = data[batchHeaderLen:]
-	var ik []byte
-	var decodedLen int
-	err = decodeBatch(data, func(i int, index batchIndex) error {
-		if i >= batchLen {
-			return newErrBatchCorrupted("invalid records length")
-		}
-		ik = makeInternalKey(ik, index.k(data), seq+uint64(i), index.keyType)
-		if err := mdb.Put(ik, index.v(data)); err != nil {
-			return err
-		}
-		decodedLen++
-		return nil
-	})
-	if err == nil && decodedLen != batchLen {
-		err = newErrBatchCorrupted(fmt.Sprintf("invalid records length: %d vs %d", batchLen, decodedLen))
+	// Decode the entire batch before applying it. The batch is applied to
+	// the memdb only after it has been fully decoded, so that a corrupted
+	// batch never leaves partially applied records behind.
+	var batch Batch
+	if err := batch.decode(data[batchHeaderLen:], batchLen); err != nil {
+		return 0, 0, err
 	}
-	return
+	if err := batch.putMem(seq, mdb); err != nil {
+		return 0, 0, err
+	}
+	return seq, batchLen, nil
 }
 
 func encodeBatchHeader(dst []byte, seq uint64, batchLen int) []byte {
