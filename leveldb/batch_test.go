@@ -13,6 +13,8 @@ import (
 	"testing"
 	"testing/quick"
 
+	"github.com/syndtr/goleveldb/leveldb/comparer"
+	"github.com/syndtr/goleveldb/leveldb/memdb"
 	"github.com/syndtr/goleveldb/leveldb/testutil"
 )
 
@@ -27,6 +29,57 @@ func TestBatchHeader(t *testing.T) {
 	}
 	if err := quick.Check(f, config); err != nil {
 		t.Error(err)
+	}
+}
+
+func TestBatchDecodeToMemAtomic(t *testing.T) {
+	// Build a valid 3-entry batch payload.
+	batch := new(Batch)
+	batch.Put([]byte("k1"), []byte("v1"))
+	batch.Put([]byte("k2"), []byte("v2"))
+	batch.Delete([]byte("k3"))
+	data := encodeBatchHeader(nil, 0, batch.Len())
+	data = append(data, batch.Dump()...)
+
+	newMem := func() *memdb.DB {
+		return memdb.New(comparer.DefaultComparer, 0)
+	}
+
+	// An intact batch is fully replayed.
+	mdb := newMem()
+	seq, n, err := decodeBatchToMem(data, 0, mdb)
+	if err != nil {
+		t.Fatal("unexpected error: ", err)
+	}
+	if seq != 0 || n != 3 {
+		t.Fatalf("invalid header, seq=%d n=%d", seq, n)
+	}
+	if mdb.Len() != 3 {
+		t.Fatalf("invalid memdb length, want=3 got=%d", mdb.Len())
+	}
+
+	// A batch torn at any point must be rejected as a whole: not a single
+	// entry may enter the memtable.
+	for i := 0; i < len(data); i++ {
+		mdb := newMem()
+		if _, _, err := decodeBatchToMem(data[:i], 0, mdb); err == nil {
+			t.Fatalf("trunc=%d: expect error", i)
+		}
+		if mdb.Len() != 0 {
+			t.Fatalf("trunc=%d: partial batch entered memtable (%d entries)", i, mdb.Len())
+		}
+	}
+
+	// A record count that doesn't match the payload rejects the whole
+	// batch as well.
+	corrupted := append([]byte(nil), data...)
+	corrupted[8] = 10
+	mdb = newMem()
+	if _, _, err := decodeBatchToMem(corrupted, 0, mdb); err == nil {
+		t.Fatal("expect error")
+	}
+	if mdb.Len() != 0 {
+		t.Fatalf("partial batch entered memtable (%d entries)", mdb.Len())
 	}
 }
 

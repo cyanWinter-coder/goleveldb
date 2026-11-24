@@ -30,6 +30,22 @@ func (d dropper) Drop(err error) {
 	}
 }
 
+// journalRecoveryDropper wraps dropper and records the first corruption
+// dropped by the journal reader, so that journal recovery can stop at the
+// safe truncation point instead of parsing past a torn write.
+type journalRecoveryDropper struct {
+	s   *session
+	fd  storage.FileDesc
+	err error
+}
+
+func (d *journalRecoveryDropper) Drop(err error) {
+	if d.err == nil {
+		d.err = err
+	}
+	dropper{d.s, d.fd}.Drop(err)
+}
+
 func (s *session) log(v ...interface{})                 { s.stor.Log(fmt.Sprint(v...)) }
 func (s *session) logf(format string, v ...interface{}) { s.stor.Log(fmt.Sprintf(format, v...)) }
 

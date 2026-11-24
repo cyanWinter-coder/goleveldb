@@ -487,6 +487,24 @@ func recoverTable(s *session, o *opt.Options) error {
 	return s.commit(rec, false)
 }
 
+// journalRecoveryBoundary decides how journal recovery proceeds after a
+// corruption was dropped while replaying the journal file fd. A corruption
+// in the last journal file is treated as a torn tail: replay stops at this
+// safe truncation point and the bytes past it are neither replayed nor
+// appended to (a fresh journal file is created after recovery). A corruption
+// in any older, fully committed journal segment is a stable error and must
+// not be silently skipped.
+func journalRecoveryBoundary(s *session, fd storage.FileDesc, last bool, cerr error) (stop bool, err error) {
+	if cerr == nil {
+		cerr = &journal.ErrCorrupted{Reason: "unknown corruption"}
+	}
+	if last {
+		s.logf("journal@recovery stop @%d: %v", fd.Num, cerr)
+		return true, nil
+	}
+	return false, errors.NewErrCorrupted(fd, cerr)
+}
+
 func (db *DB) recoverJournal() error {
 	// Get all journals and sort it by file number.
 	rawFds, err := db.s.stor.List(storage.TypeJournal)
@@ -528,7 +546,10 @@ func (db *DB) recoverJournal() error {
 			batchLen int
 		)
 
-		for _, fd := range fds {
+		for i, fd := range fds {
+			// Whether this is the last journal file; only its tail may be
+			// truncated on corruption.
+			last := i == len(fds)-1
 			db.logf("journal@recovery recovering @%d", fd.Num)
 
 			fr, err := db.s.stor.Open(fd)
@@ -536,12 +557,15 @@ func (db *DB) recoverJournal() error {
 				return err
 			}
 
-			// Create or reset journal reader instance.
+			// Create or reset journal reader instance. The dropper records
+			// the first dropped corruption so that replay can stop at the
+			// safe truncation point instead of parsing past it.
+			drp := &journalRecoveryDropper{s: db.s, fd: fd}
 			if jr == nil {
-				jr = journal.NewReader(fr, dropper{db.s, fd}, strict, checksum)
+				jr = journal.NewReader(fr, drp, strict, checksum)
 			} else {
 				// Ignore the error here
-				_ = jr.Reset(fr, dropper{db.s, fd}, strict, checksum)
+				_ = jr.Reset(fr, drp, strict, checksum)
 			}
 
 			// Flush memdb and remove obsolete journal file.
@@ -574,6 +598,13 @@ func (db *DB) recoverJournal() error {
 				r, err := jr.Next()
 				if err != nil {
 					if err == io.EOF {
+						if drp.err != nil {
+							// The file ends right after a corruption.
+							if _, err := journalRecoveryBoundary(db.s, fd, last, drp.err); err != nil {
+								fr.Close()
+								return err
+							}
+						}
 						break
 					}
 
@@ -581,10 +612,29 @@ func (db *DB) recoverJournal() error {
 					return errors.SetFd(err, fd)
 				}
 
+				if drp.err != nil {
+					// A corruption was dropped while locating this record.
+					// Bytes past the first corruption must not be replayed:
+					// they may belong to a torn write or a stale file
+					// generation.
+					if stop, err := journalRecoveryBoundary(db.s, fd, last, drp.err); err != nil {
+						fr.Close()
+						return err
+					} else if stop {
+						break
+					}
+				}
+
 				buf.Reset()
 				if _, err := buf.ReadFrom(r); err != nil {
 					if err == io.ErrUnexpectedEOF {
 						// This is error returned due to corruption, with strict == false.
+						if stop, err := journalRecoveryBoundary(db.s, fd, last, drp.err); err != nil {
+							fr.Close()
+							return err
+						} else if stop {
+							break
+						}
 						continue
 					}
 
@@ -594,8 +644,16 @@ func (db *DB) recoverJournal() error {
 				batchSeq, batchLen, err = decodeBatchToMem(buf.Bytes(), db.seq, mdb)
 				if err != nil {
 					if !strict && errors.IsCorrupted(err) {
-						db.s.logf("journal error: %v (skipped)", err)
-						// We won't apply sequence number as it might be corrupted.
+						// A corrupted batch never enters the memtable
+						// partially; treat it as the truncation point of the
+						// last journal, or fail when it belongs to an older,
+						// committed segment.
+						if stop, err := journalRecoveryBoundary(db.s, fd, last, err); err != nil {
+							fr.Close()
+							return err
+						} else if stop {
+							break
+						}
 						continue
 					}
 
@@ -692,7 +750,10 @@ func (db *DB) recoverJournalRO() error {
 			batchLen int
 		)
 
-		for _, fd := range fds {
+		for i, fd := range fds {
+			// Whether this is the last journal file; only its tail may be
+			// truncated on corruption.
+			last := i == len(fds)-1
 			db.logf("journal@recovery recovering @%d", fd.Num)
 
 			fr, err := db.s.stor.Open(fd)
@@ -700,11 +761,14 @@ func (db *DB) recoverJournalRO() error {
 				return err
 			}
 
-			// Create or reset journal reader instance.
+			// Create or reset journal reader instance. The dropper records
+			// the first dropped corruption so that replay can stop at the
+			// safe truncation point instead of parsing past it.
+			drp := &journalRecoveryDropper{s: db.s, fd: fd}
 			if jr == nil {
-				jr = journal.NewReader(fr, dropper{db.s, fd}, strict, checksum)
+				jr = journal.NewReader(fr, drp, strict, checksum)
 			} else {
-				if err := jr.Reset(fr, dropper{db.s, fd}, strict, checksum); err != nil {
+				if err := jr.Reset(fr, drp, strict, checksum); err != nil {
 					return err
 				}
 			}
@@ -714,6 +778,13 @@ func (db *DB) recoverJournalRO() error {
 				r, err := jr.Next()
 				if err != nil {
 					if err == io.EOF {
+						if drp.err != nil {
+							// The file ends right after a corruption.
+							if _, err := journalRecoveryBoundary(db.s, fd, last, drp.err); err != nil {
+								fr.Close()
+								return err
+							}
+						}
 						break
 					}
 
@@ -721,10 +792,29 @@ func (db *DB) recoverJournalRO() error {
 					return errors.SetFd(err, fd)
 				}
 
+				if drp.err != nil {
+					// A corruption was dropped while locating this record.
+					// Bytes past the first corruption must not be replayed:
+					// they may belong to a torn write or a stale file
+					// generation.
+					if stop, err := journalRecoveryBoundary(db.s, fd, last, drp.err); err != nil {
+						fr.Close()
+						return err
+					} else if stop {
+						break
+					}
+				}
+
 				buf.Reset()
 				if _, err := buf.ReadFrom(r); err != nil {
 					if err == io.ErrUnexpectedEOF {
 						// This is error returned due to corruption, with strict == false.
+						if stop, err := journalRecoveryBoundary(db.s, fd, last, drp.err); err != nil {
+							fr.Close()
+							return err
+						} else if stop {
+							break
+						}
 						continue
 					}
 
@@ -734,8 +824,16 @@ func (db *DB) recoverJournalRO() error {
 				batchSeq, batchLen, err = decodeBatchToMem(buf.Bytes(), db.seq, mdb)
 				if err != nil {
 					if !strict && errors.IsCorrupted(err) {
-						db.s.logf("journal error: %v (skipped)", err)
-						// We won't apply sequence number as it might be corrupted.
+						// A corrupted batch never enters the memtable
+						// partially; treat it as the truncation point of the
+						// last journal, or fail when it belongs to an older,
+						// committed segment.
+						if stop, err := journalRecoveryBoundary(db.s, fd, last, err); err != nil {
+							fr.Close()
+							return err
+						} else if stop {
+							break
+						}
 						continue
 					}
 

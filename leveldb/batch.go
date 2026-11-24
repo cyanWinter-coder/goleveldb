@@ -324,21 +324,31 @@ func decodeBatchToMem(data []byte, expectSeq uint64, mdb *memdb.DB) (seq uint64,
 		return 0, 0, newErrBatchCorrupted("invalid sequence number")
 	}
 	data = data[batchHeaderLen:]
-	var ik []byte
+	// Validate the entire batch first. A batch that cannot be decoded in
+	// full is either corrupted or torn by a crash mid-write, and must not
+	// partially enter the memtable.
 	var decodedLen int
 	err = decodeBatch(data, func(i int, index batchIndex) error {
 		if i >= batchLen {
 			return newErrBatchCorrupted("invalid records length")
-		}
-		ik = makeInternalKey(ik, index.k(data), seq+uint64(i), index.keyType)
-		if err := mdb.Put(ik, index.v(data)); err != nil {
-			return err
 		}
 		decodedLen++
 		return nil
 	})
 	if err == nil && decodedLen != batchLen {
 		err = newErrBatchCorrupted(fmt.Sprintf("invalid records length: %d vs %d", batchLen, decodedLen))
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	// The batch is fully valid, replay it into the memtable.
+	var ik []byte
+	err = decodeBatch(data, func(i int, index batchIndex) error {
+		ik = makeInternalKey(ik, index.k(data), seq+uint64(i), index.keyType)
+		return mdb.Put(ik, index.v(data))
+	})
+	if err != nil {
+		return 0, 0, err
 	}
 	return
 }
