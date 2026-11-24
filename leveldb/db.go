@@ -787,21 +787,20 @@ func (db *DB) get(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.R
 		}
 	}
 
-	em, fm := db.getMems()
-	for _, m := range [...]*memDB{em, fm} {
+	// Pin the effective/frozen memdbs and the table version together so the
+	// read observes one coherent generation set.
+	rs := db.acquireReadState()
+	defer rs.release()
+	for _, m := range [...]*memDB{rs.em, rs.fm} {
 		if m == nil {
 			continue
 		}
-		defer m.decref()
-
 		if ok, mv, me := memGet(m.DB, ikey, db.s.icmp); ok {
 			return append([]byte(nil), mv...), me
 		}
 	}
 
-	v := db.s.version()
-	value, cSched, err := v.get(auxt, ikey, ro, false)
-	v.release()
+	value, cSched, err := rs.v.get(auxt, ikey, ro, false)
 	if cSched {
 		// Trigger table compaction.
 		db.compTrigger(db.tcompCmdC)
@@ -825,21 +824,18 @@ func (db *DB) has(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.R
 		}
 	}
 
-	em, fm := db.getMems()
-	for _, m := range [...]*memDB{em, fm} {
+	rs := db.acquireReadState()
+	defer rs.release()
+	for _, m := range [...]*memDB{rs.em, rs.fm} {
 		if m == nil {
 			continue
 		}
-		defer m.decref()
-
 		if ok, _, me := memGet(m.DB, ikey, db.s.icmp); ok {
 			return me == nil, nilIfNotFound(me)
 		}
 	}
 
-	v := db.s.version()
-	_, cSched, err := v.get(auxt, ikey, ro, true)
-	v.release()
+	_, cSched, err := rs.v.get(auxt, ikey, ro, true)
 	if cSched {
 		// Trigger table compaction.
 		db.compTrigger(db.tcompCmdC)

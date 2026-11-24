@@ -278,7 +278,9 @@ func (h *dbHarness) allEntriesFor(key, want string) {
 	s := db.s
 
 	ikey := makeInternalKey(nil, []byte(key), keyMaxSeq, keyTypeVal)
-	iter := db.newRawIterator(nil, nil, nil, nil)
+	rs := db.acquireReadState()
+	defer rs.release()
+	iter := db.newRawIterator(rs, nil, nil, nil, nil)
 	if !iter.Seek(ikey) && iter.Error() != nil {
 		t.Error("AllEntries: error during seek, err: ", iter.Error())
 		return

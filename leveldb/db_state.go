@@ -8,6 +8,7 @@ package leveldb
 
 import (
 	"errors"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -46,6 +47,50 @@ func (m *memDB) decref() {
 	} else if ref < 0 {
 		panic("negative memdb ref")
 	}
+}
+
+// readState is a coherent, immutable snapshot of the set of storage
+// generations that a read or iterator operates on: the effective memdb,
+// possibly a frozen memdb and one version of the table set.
+//
+// All three are captured in a single critical section while holding memMu,
+// and every captured generation carries an extra reference owned by the
+// readState. A memtable rotation (or a flush commit) happening afterwards
+// swaps the DB pointers but cannot change what this readState sees, nor
+// reclaim the pinned generations. Callers must pair every readState with
+// exactly one release.
+type readState struct {
+	em, fm *memDB
+	v      *version
+}
+
+// release drops every reference captured by the readState. It is safe to
+// call on a nil readState.
+func (rs *readState) release() {
+	if rs == nil {
+		return
+	}
+	if rs.em != nil {
+		rs.em.decref()
+	}
+	if rs.fm != nil {
+		rs.fm.decref()
+	}
+	if rs.v != nil {
+		rs.v.release()
+	}
+}
+
+// readStateReleaser adapts a readState to the iterator releaser interface.
+type readStateReleaser struct {
+	once sync.Once
+	rs   *readState
+}
+
+func (r *readStateReleaser) Release() {
+	r.once.Do(func() {
+		r.rs.release()
+	})
 }
 
 // Get latest sequence number.
@@ -117,9 +162,39 @@ func (db *DB) mpoolDrain() {
 	}
 }
 
+// abortNewJournal discards a freshly created journal that never became the
+// active one. It closes the writer and removes the file so that no file
+// descriptor nor file number leaks after a failed rotation.
+func (db *DB) abortNewJournal(fd storage.FileDesc, w storage.Writer, jw *journal.Writer) {
+	if err := jw.Close(); err != nil {
+		db.logf("journal@abort close @%d %q", fd.Num, err)
+	}
+	if err := w.Close(); err != nil {
+		db.logf("journal@abort close writer @%d %q", fd.Num, err)
+	}
+	if err := db.s.stor.Remove(fd); err != nil {
+		db.logf("journal@abort remove @%d %q", fd.Num, err)
+	}
+	db.s.reuseFileNum(fd.Num)
+}
+
 // Create new memdb and froze the old one; need external synchronization.
 // newMem only called synchronously by the writer.
+//
+// The rotation is all-or-nothing: it promotes exactly one generation and
+// never mutates the serving state unless every step succeeds. On any error
+// the previous effective memdb, frozen memdb and journal stay in place and
+// continue to serve reads and writes.
 func (db *DB) newMem(n int) (mem *memDB, err error) {
+	db.memMu.Lock()
+	defer db.memMu.Unlock()
+
+	// Reject the rotation before allocating anything so a frozen memdb that
+	// hasn't been flushed yet keeps being served and no journal is leaked.
+	if db.frozenMem != nil {
+		return nil, errHasFrozenMem
+	}
+
 	fd := storage.FileDesc{Type: storage.TypeJournal, Num: db.s.allocFileNum()}
 	w, err := db.s.stor.Create(fd)
 	if err != nil {
@@ -127,50 +202,84 @@ func (db *DB) newMem(n int) (mem *memDB, err error) {
 		return
 	}
 
-	db.memMu.Lock()
-	defer db.memMu.Unlock()
+	// The new journal and memdb are staged in local variables and only
+	// published to the DB once the old journal has been sealed successfully.
+	newJournal := journal.NewWriter(w)
+	newMem := db.mpoolGet(n)
 
-	if db.frozenMem != nil {
-		return nil, errHasFrozenMem
+	oldJournal := db.journal
+	oldWriter := db.journalWriter
+	oldJournalFd := db.journalFd
+	if oldJournal != nil {
+		// Seal the old journal onto the new writer. On failure the active
+		// journal is untouched and the staged one is discarded.
+		if err = oldJournal.Reset(w); err != nil {
+			db.abortNewJournal(fd, w, newJournal)
+			return
+		}
+		// The old journal is switched to the new writer already; closing the
+		// old writer finalizes the previous file. A failure rolls the journal
+		// back to the old writer before discarding the staged journal.
+		if err = oldWriter.Close(); err != nil {
+			if rerr := oldJournal.Reset(oldWriter); rerr != nil {
+				db.logf("journal@rollback @%d %q", oldJournalFd.Num, rerr)
+			}
+			db.abortNewJournal(fd, w, newJournal)
+			return
+		}
 	}
 
-	if db.journal == nil {
-		db.journal = journal.NewWriter(w)
-	} else {
-		if err := db.journal.Reset(w); err != nil {
-			return nil, err
-		}
-		if err := db.journalWriter.Close(); err != nil {
-			return nil, err
-		}
-		db.frozenJournalFd = db.journalFd
+	// Commit the rotation. From here on every mutation is a pointer swap that
+	// cannot fail, so the frozen memtable remains read-only and the old
+	// serving state is preserved intact until the flush task takes over.
+	if oldJournal == nil {
+		db.journal = newJournal
 	}
 	db.journalWriter = w
 	db.journalFd = fd
+	if oldJournal != nil {
+		db.frozenJournalFd = oldJournalFd
+	}
 	db.frozenMem = db.mem
-	mem = db.mpoolGet(n)
-	mem.incref() // for self
-	mem.incref() // for caller
-	db.mem = mem
+	newMem.incref() // for self
+	newMem.incref() // for caller
+	db.mem = newMem
+	mem = newMem
 	// The seq only incremented by the writer. And whoever called newMem
 	// should hold write lock, so no need additional synchronization here.
 	db.frozenSeq = db.seq
 	return
 }
 
-// Get all memdbs.
-func (db *DB) getMems() (e, f *memDB) {
+// acquireReadState pins a coherent read snapshot of the current memdbs and
+// the table version. The effective and frozen memdbs are captured atomically
+// under memMu so a rotation that happens concurrently cannot make a key
+// appear in, or disappear from, only one of them. The version is captured
+// right after; the version pointer only moves forward and a frozen memdb is
+// only dropped after its flush commit, so the pinned combination can never
+// miss data nor expose a state older than the captured memdbs.
+//
+// The returned readState owns one reference to each pinned generation and
+// must be released exactly once.
+func (db *DB) acquireReadState() *readState {
+	rs := &readState{}
+
 	db.memMu.RLock()
-	defer db.memMu.RUnlock()
 	if db.mem != nil {
 		db.mem.incref()
+		rs.em = db.mem
 	} else if !db.isClosed() {
+		db.memMu.RUnlock()
 		panic("nil effective mem")
 	}
 	if db.frozenMem != nil {
 		db.frozenMem.incref()
+		rs.fm = db.frozenMem
 	}
-	return db.mem, db.frozenMem
+	db.memMu.RUnlock()
+
+	rs.v = db.s.version()
+	return rs
 }
 
 // Get effective memdb.

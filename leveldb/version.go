@@ -556,18 +556,3 @@ func (p *versionStaging) finish(trivial bool) *version {
 
 	return nv
 }
-
-type versionReleaser struct {
-	v    *version
-	once bool
-}
-
-func (vr *versionReleaser) Release() {
-	v := vr.v
-	v.s.vmu.Lock()
-	if !vr.once {
-		v.releaseNB()
-		vr.once = true
-	}
-	v.s.vmu.Unlock()
-}

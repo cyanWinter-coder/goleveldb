@@ -28,10 +28,9 @@ func (mr *memdbReleaser) Release() {
 	})
 }
 
-func (db *DB) newRawIterator(auxm *memDB, auxt tFiles, slice *util.Range, ro *opt.ReadOptions) iterator.Iterator {
+func (db *DB) newRawIterator(rs *readState, auxm *memDB, auxt tFiles, slice *util.Range, ro *opt.ReadOptions) iterator.Iterator {
 	strict := opt.GetStrict(db.s.o.Options, ro, opt.StrictReader)
-	em, fm := db.getMems()
-	v := db.s.version()
+	v := rs.v
 
 	tableIts := v.getIterators(slice, ro)
 	n := len(tableIts) + len(auxt) + 3
@@ -46,17 +45,18 @@ func (db *DB) newRawIterator(auxm *memDB, auxt tFiles, slice *util.Range, ro *op
 		its = append(its, v.s.tops.newIterator(t, slice, ro))
 	}
 
-	emi := em.NewIterator(slice)
-	emi.SetReleaser(&memdbReleaser{m: em})
+	emi := rs.em.NewIterator(slice)
 	its = append(its, emi)
-	if fm != nil {
-		fmi := fm.NewIterator(slice)
-		fmi.SetReleaser(&memdbReleaser{m: fm})
+	if rs.fm != nil {
+		fmi := rs.fm.NewIterator(slice)
 		its = append(its, fmi)
 	}
 	its = append(its, tableIts...)
 	mi := iterator.NewMergedIterator(its, db.s.icmp, strict)
-	mi.SetReleaser(&versionReleaser{v: v})
+	// The merged iterator owns the readState: releasing it drops the pinned
+	// effective/frozen memdb and version references together. The memdb
+	// iterators themselves carry no releaser to avoid double-decref.
+	mi.SetReleaser(&readStateReleaser{rs: rs})
 	return mi
 }
 
@@ -71,7 +71,11 @@ func (db *DB) newIterator(auxm *memDB, auxt tFiles, seq uint64, slice *util.Rang
 			islice.Limit = makeInternalKey(nil, slice.Limit, keyMaxSeq, keyTypeSeek)
 		}
 	}
-	rawIter := db.newRawIterator(auxm, auxt, islice, ro)
+	// Pin the memdbs and version set at iterator creation time. The snapshot
+	// sequence can be released afterwards because all generations are kept
+	// alive by the readState references.
+	rs := db.acquireReadState()
+	rawIter := db.newRawIterator(rs, auxm, auxt, islice, ro)
 	iter := &dbIter{
 		db:              db,
 		icmp:            db.s.icmp,
