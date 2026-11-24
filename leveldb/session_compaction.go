@@ -53,35 +53,70 @@ func (s *session) flushMemdb(rec *sessionRecord, mdb *memdb.DB, maxLevel int) (i
 }
 
 // Pick a compaction based on current state; need external synchronization.
-func (s *session) pickCompaction() *compaction {
+//
+// The minSeq and pinned parameters describe the current snapshot horizon
+// (see DB.compactionHorizon). When the horizon is pinned by a live
+// snapshot, tables that were already rebuilt under the same or a newer
+// horizon are skipped: compacting them again cannot drop any additional
+// entry and would only burn resources on a no-progress compaction.
+func (s *session) pickCompaction(minSeq uint64, pinned bool) *compaction {
 	v := s.version()
 
-	var sourceLevel int
-	var t0 tFiles
-	var typ int
-	if v.cScore >= 1 {
+	var (
+		sourceLevel = -1
+		t0          tFiles
+		typ         int
+	)
+	if pinned {
+		sourceLevel = v.pickCompactionLevel(minSeq, true)
+	} else if v.cScore >= 1 {
 		sourceLevel = v.cLevel
+	}
+
+	if sourceLevel >= 0 {
 		cptr := s.getCompPtr(sourceLevel)
 		tables := v.levels[sourceLevel]
-		if cptr != nil && sourceLevel > 0 {
+		if sourceLevel > 0 {
+			// Select the first table past the compaction pointer,
+			// wrapping around to the beginning of the level. When the
+			// snapshot horizon is pinned, tables already rebuilt under
+			// the current horizon are skipped.
 			n := len(tables)
-			if i := sort.Search(n, func(i int) bool {
-				return s.icmp.Compare(tables[i].imax, cptr) > 0
-			}); i < n {
-				t0 = append(t0, tables[i])
+			start := 0
+			if cptr != nil {
+				if i := sort.Search(n, func(i int) bool {
+					return s.icmp.Compare(tables[i].imax, cptr) > 0
+				}); i < n {
+					start = i
+				}
 			}
-		}
-		if len(t0) == 0 {
-			t0 = append(t0, tables[0])
-		}
-		if sourceLevel == 0 {
-			typ = level0Compaction
-		} else {
+			for i := 0; i < n; i++ {
+				if t := tables[(start+i)%n]; !pinned || t.compactionEligible(minSeq) {
+					t0 = append(t0, t)
+					break
+				}
+			}
+			if len(t0) == 0 {
+				// Every table in this level was already compacted under
+				// the current snapshot horizon; there is no productive
+				// compaction to do right now.
+				v.release()
+				return nil
+			}
 			typ = nonLevel0Compaction
+		} else {
+			t0 = append(t0, tables[0])
+			typ = level0Compaction
 		}
 	} else {
 		if p := atomic.LoadPointer(&v.cSeek); p != nil {
 			ts := (*tSet)(p)
+			if pinned && !ts.table.compactionEligible(minSeq) {
+				// The seek-triggered table was already rebuilt under
+				// the current snapshot horizon.
+				v.release()
+				return nil
+			}
 			sourceLevel = ts.level
 			t0 = append(t0, ts.table)
 			typ = seekCompaction

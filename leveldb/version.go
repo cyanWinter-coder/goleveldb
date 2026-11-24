@@ -31,8 +31,9 @@ type version struct {
 	// Level that should be compacted next and its compaction score.
 	// Score < 1 means compaction is not strictly needed. These fields
 	// are initialized by computeCompaction()
-	cLevel int
-	cScore float64
+	cLevel  int
+	cScore  float64
+	cScores []float64
 
 	cSeek unsafe.Pointer
 
@@ -361,6 +362,7 @@ func (v *version) computeCompaction() {
 	statSizes := make([]string, len(v.levels))
 	statScore := make([]string, len(v.levels))
 	statTotSize := int64(0)
+	scores := make([]float64, len(v.levels))
 
 	for level, tables := range v.levels {
 		var score float64
@@ -387,6 +389,7 @@ func (v *version) computeCompaction() {
 			bestScore = score
 		}
 
+		scores[level] = score
 		statFiles[level] = len(tables)
 		statSizes[level] = shortenb(size)
 		statScore[level] = fmt.Sprintf("%.2f", score)
@@ -395,12 +398,56 @@ func (v *version) computeCompaction() {
 
 	v.cLevel = bestLevel
 	v.cScore = bestScore
+	v.cScores = scores
 
 	v.s.logf("version@stat F·%v S·%s%v Sc·%v", statFiles, shortenb(statTotSize), statSizes, statScore)
 }
 
 func (v *version) needCompaction() bool {
 	return v.cScore >= 1 || atomic.LoadPointer(&v.cSeek) != nil
+}
+
+// pickCompactionLevel returns the highest-scored level that needs
+// compaction and whose tables can make progress under the given snapshot
+// horizon, or -1 if there is none. Level-0 is always considered eligible
+// because compacting it reduces the number of level-0 files regardless of
+// the horizon. For other levels, a level is eligible only if it contains
+// at least one table that was not already rebuilt under the current (or a
+// newer) horizon; rebuilding such tables again could not drop any
+// additional entry and would only burn resources on a no-progress
+// compaction.
+func (v *version) pickCompactionLevel(minSeq uint64, pinned bool) (bestLevel int) {
+	bestLevel = -1
+	bestScore := float64(0)
+	for level, score := range v.cScores {
+		if score < 1 || score <= bestScore {
+			continue
+		}
+		if pinned && level != 0 && !v.levels[level].hasCompactionEligibleTable(minSeq) {
+			continue
+		}
+		bestLevel, bestScore = level, score
+	}
+	return
+}
+
+// hasEligibleCompaction reports whether a compaction picked from this
+// version could make progress under the given snapshot horizon. When the
+// horizon is not pinned by a live snapshot this is equivalent to
+// needCompaction.
+func (v *version) hasEligibleCompaction(minSeq uint64, pinned bool) bool {
+	if !pinned {
+		return v.needCompaction()
+	}
+	if v.pickCompactionLevel(minSeq, true) >= 0 {
+		return true
+	}
+	if p := atomic.LoadPointer(&v.cSeek); p != nil {
+		if (*tSet)(p).table.compactionEligible(minSeq) {
+			return true
+		}
+	}
+	return false
 }
 
 type tablesScratch struct {

@@ -26,6 +26,23 @@ type tFile struct {
 	seekLeft   int32
 	size       int64
 	imin, imax internalKey
+
+	// cMinSeq is the snapshot horizon (minimum visible sequence number)
+	// under which this table was last rebuilt by a table compaction.
+	// A zero value means the table was never produced by a table
+	// compaction (e.g. created by a memdb flush or loaded from the
+	// manifest), in which case it is always eligible for compaction.
+	// This is an in-memory only watermark; it is not persisted in the
+	// manifest.
+	cMinSeq uint64
+}
+
+// compactionEligible reports whether rebuilding this table under the given
+// snapshot horizon could make progress, i.e. whether there may be entries
+// that became droppable since the table was last rebuilt. Tables never
+// compacted before (cMinSeq == 0) are always eligible.
+func (t *tFile) compactionEligible(minSeq uint64) bool {
+	return t.cMinSeq == 0 || t.cMinSeq < minSeq
 }
 
 // Returns true if given key is after largest key of this table.
@@ -79,11 +96,24 @@ func newTableFile(fd storage.FileDesc, size int64, imin, imax internalKey) *tFil
 }
 
 func tableFileFromRecord(r atRecord) *tFile {
-	return newTableFile(storage.FileDesc{Type: storage.TypeTable, Num: r.num}, r.size, r.imin, r.imax)
+	t := newTableFile(storage.FileDesc{Type: storage.TypeTable, Num: r.num}, r.size, r.imin, r.imax)
+	t.cMinSeq = r.cMinSeq
+	return t
 }
 
 // tFiles hold multiple tFile.
 type tFiles []*tFile
+
+// hasCompactionEligibleTable reports whether at least one table could
+// make compaction progress under the given snapshot horizon.
+func (tf tFiles) hasCompactionEligibleTable(minSeq uint64) bool {
+	for _, t := range tf {
+		if t.compactionEligible(minSeq) {
+			return true
+		}
+	}
+	return false
+}
 
 func (tf tFiles) Len() int      { return len(tf) }
 func (tf tFiles) Swap(i, j int) { tf[i], tf[j] = tf[j], tf[i] }

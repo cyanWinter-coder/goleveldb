@@ -258,6 +258,20 @@ func (db *DB) compactionExitTransact() {
 	panic(errCompactionTransactExiting)
 }
 
+// compactionCommit commits the compaction record as a single
+// rollback-able switch: either the record is durably appended to the
+// manifest and the new version (with the output tables) is installed, or
+// the switch is rolled back and the in-memory state is left exactly as
+// before — the old version stays installed, compaction pointers and
+// session state are untouched, the spawned version id is abandoned and no
+// reference-count delta is applied to the reference loop.
+//
+// Note that the output tables must NOT be removed when the commit fails:
+// the record may already have reached the manifest (e.g. when only the
+// final sync failed), in which case recovery will install the new version
+// and reference those tables. Output tables created by a compaction that
+// never reaches the commit phase are removed by the build transact's
+// revert hook instead.
 func (db *DB) compactionCommit(name string, rec *sessionRecord) {
 	db.compCommitLk.Lock()
 	defer db.compCommitLk.Unlock() // Defer is necessary.
@@ -576,7 +590,7 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool) {
 		}
 	}
 	sourceSize := stats[0].read + stats[1].read
-	minSeq := db.minSeq()
+	minSeq, _ := db.compactionHorizon()
 	db.logf("table@compaction L%d·%d -> L%d·%d S·%s Q·%d", c.sourceLevel, len(c.levels[0]), c.sourceLevel+1, len(c.levels[1]), shortenb(sourceSize), minSeq)
 
 	b := &tableCompactionBuilder{
@@ -590,6 +604,13 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool) {
 		tableSize: db.s.o.GetCompactionTableSize(c.sourceLevel + 1),
 	}
 	db.compactionTransact("table@build", b)
+
+	// Stamp the output tables with the snapshot horizon they were built
+	// under, so that later compaction picks can tell whether rebuilding
+	// them could drop any additional entry.
+	for i := range rec.addedTables {
+		rec.addedTables[i].cMinSeq = minSeq
+	}
 
 	// Commit.
 	stats[1].startTimer()
@@ -652,7 +673,8 @@ func (db *DB) tableRangeCompaction(level int, umin, umax []byte) error {
 }
 
 func (db *DB) tableAutoCompaction() {
-	if c := db.s.pickCompaction(); c != nil {
+	minSeq, pinned := db.compactionHorizon()
+	if c := db.s.pickCompaction(minSeq, pinned); c != nil {
 		db.tableCompaction(c, false)
 	}
 }
@@ -660,7 +682,8 @@ func (db *DB) tableAutoCompaction() {
 func (db *DB) tableNeedCompaction() bool {
 	v := db.s.version()
 	defer v.release()
-	return v.needCompaction()
+	minSeq, pinned := db.compactionHorizon()
+	return v.hasEligibleCompaction(minSeq, pinned)
 }
 
 // resumeWrite returns an indicator whether we should resume write operation if enough level0 files are compacted.
@@ -721,8 +744,12 @@ func (db *DB) compTrigger(compC chan<- cCmd) {
 
 // This will trigger auto compaction and/or wait for all compaction to be done.
 func (db *DB) compTriggerWait(compC chan<- cCmd) (err error) {
-	ch := make(chan error)
-	defer close(ch)
+	// The ack channel is buffered and deliberately not closed: when the
+	// wait below is interrupted (compaction error or DB close), the
+	// command may still be acked by the compaction goroutine afterwards.
+	// A buffered channel lets such a late ack complete without blocking
+	// the compaction goroutine or racing with a channel close.
+	ch := make(chan error, 1)
 	// Send cmd.
 	select {
 	case compC <- cAuto{ch}:
@@ -743,8 +770,9 @@ func (db *DB) compTriggerWait(compC chan<- cCmd) (err error) {
 
 // Send range compaction request.
 func (db *DB) compTriggerRange(compC chan<- cCmd, level int, min, max []byte) (err error) {
-	ch := make(chan error)
-	defer close(ch)
+	// See compTriggerWait for why the ack channel is buffered and not
+	// closed.
+	ch := make(chan error, 1)
 	// Send cmd.
 	select {
 	case compC <- cRange{level, min, max, ch}:

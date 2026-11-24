@@ -218,8 +218,13 @@ func (s *session) commit(r *sessionRecord, trivial bool) (err error) {
 	// abandon useless version id to prevent blocking version processing loop.
 	defer func() {
 		if err != nil {
-			s.abandon <- nv.id
-			s.logf("commit@abandon useless vid D%d", nv.id)
+			select {
+			case s.abandon <- nv.id:
+				s.logf("commit@abandon useless vid D%d", nv.id)
+			case <-s.closeC:
+				// The reference loop is already gone; the version id
+				// doesn't need to be abandoned explicitly.
+			}
 		}
 	}()
 

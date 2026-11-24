@@ -22,6 +22,14 @@ type snapshotElement struct {
 	seq uint64
 	ref int
 	e   *list.Element
+
+	// v is the version pinned on behalf of an explicit Snapshot object
+	// sharing this element. The tables of the pinned version are only
+	// removed after every snapshot and iterator referencing them has
+	// been released. It is nil for elements that only back ephemeral
+	// snapshots (e.g. the ones acquired internally by DB.Get), which
+	// don't need retention beyond their own short lifetime.
+	v *version
 }
 
 // Acquires a snapshot, based on latest sequence.
@@ -45,6 +53,19 @@ func (db *DB) acquireSnapshot() *snapshotElement {
 	return se
 }
 
+// pinSnapshotVersion pins the current version on behalf of an explicit
+// Snapshot object, so that the tables it references are kept around until
+// the snapshot element is released.
+func (db *DB) pinSnapshotVersion(se *snapshotElement) {
+	db.snapsMu.Lock()
+	defer db.snapsMu.Unlock()
+
+	if se.v == nil {
+		se.v = db.s.version()
+		db.snapsPinned++
+	}
+}
+
 // Releases given snapshot element.
 func (db *DB) releaseSnapshot(se *snapshotElement) {
 	db.snapsMu.Lock()
@@ -54,6 +75,16 @@ func (db *DB) releaseSnapshot(se *snapshotElement) {
 	if se.ref == 0 {
 		db.snapsList.Remove(se.e)
 		se.e = nil
+		if se.v != nil {
+			// Unpin the version; the tables it references may now be
+			// removed once no iterator references them either. The
+			// snapshot horizon may also have advanced, making
+			// previously unproductive compactions eligible again.
+			se.v.release()
+			se.v = nil
+			db.snapsPinned--
+			db.compTrigger(db.tcompCmdC)
+		}
 	} else if se.ref < 0 {
 		panic("leveldb: Snapshot: negative element reference")
 	}
@@ -71,6 +102,23 @@ func (db *DB) minSeq() uint64 {
 	return db.getSeq()
 }
 
+// compactionHorizon returns the current snapshot horizon: the minimum
+// sequence number that has to remain visible to readers, and whether that
+// horizon is pinned by at least one live explicit snapshot. When no
+// explicit snapshot is alive the horizon simply tracks the minimum
+// sequence of the ephemeral snapshots (or the latest sequence number)
+// and every table is eligible for compaction.
+func (db *DB) compactionHorizon() (minSeq uint64, pinned bool) {
+	db.snapsMu.Lock()
+	defer db.snapsMu.Unlock()
+
+	if e := db.snapsList.Front(); e != nil {
+		return e.Value.(*snapshotElement).seq, db.snapsPinned > 0
+	}
+
+	return db.getSeq(), false
+}
+
 // Snapshot is a DB snapshot.
 type Snapshot struct {
 	db       *DB
@@ -85,6 +133,10 @@ func (db *DB) newSnapshot() *Snapshot {
 		db:   db,
 		elem: db.acquireSnapshot(),
 	}
+	// Explicit snapshots pin the version of their snapshot element, so
+	// that the tables visible at the snapshot horizon are not removed
+	// before the snapshot (and every iterator on it) is released.
+	db.pinSnapshotVersion(snap.elem)
 	atomic.AddInt32(&db.aliveSnaps, 1)
 	runtime.SetFinalizer(snap, (*Snapshot).Release)
 	return snap

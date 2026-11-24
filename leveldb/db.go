@@ -59,8 +59,9 @@ type DB struct {
 	frozenSeq       uint64
 
 	// Snapshot.
-	snapsMu   sync.Mutex
-	snapsList *list.List
+	snapsMu     sync.Mutex
+	snapsList   *list.List
+	snapsPinned int // number of snapshot elements with a pinned version
 
 	// Write.
 	batchPool    sync.Pool

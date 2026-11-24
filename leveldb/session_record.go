@@ -45,6 +45,11 @@ type atRecord struct {
 	size  int64
 	imin  internalKey
 	imax  internalKey
+
+	// cMinSeq is the snapshot horizon under which the table was built.
+	// It is an in-memory only annotation and is never encoded into the
+	// manifest.
+	cMinSeq uint64
 }
 
 type dtRecord struct {
@@ -107,12 +112,23 @@ func (p *sessionRecord) resetCompPtrs() {
 }
 
 func (p *sessionRecord) addTable(level int, num, size int64, imin, imax internalKey) {
+	p.addTableInternal(level, num, size, imin, imax, 0)
+}
+
+func (p *sessionRecord) addTableInternal(level int, num, size int64, imin, imax internalKey, cMinSeq uint64) {
 	p.hasRec |= 1 << recAddTable
-	p.addedTables = append(p.addedTables, atRecord{level, num, size, imin, imax})
+	p.addedTables = append(p.addedTables, atRecord{
+		level:   level,
+		num:     num,
+		size:    size,
+		imin:    imin,
+		imax:    imax,
+		cMinSeq: cMinSeq,
+	})
 }
 
 func (p *sessionRecord) addTableFile(level int, t *tFile) {
-	p.addTable(level, t.fd.Num, t.size, t.imin, t.imax)
+	p.addTableInternal(level, t.fd.Num, t.size, t.imin, t.imax, t.cMinSeq)
 }
 
 func (p *sessionRecord) resetAddedTables() {
