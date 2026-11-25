@@ -172,6 +172,29 @@ func (ms *memStorage) Rename(oldfd, newfd FileDesc) error {
 
 func (*memStorage) Close() error { return nil }
 
+// MemFileMutator is implemented by the memory-backed storage and lets tests
+// overwrite the raw bytes of a stored file without opening it. This is needed
+// to corrupt a table whose reader is still pinned in a cache.
+type MemFileMutator interface {
+	// MutateFile replaces the content of the given file with fn applied to
+	// its current bytes.
+	MutateFile(fd FileDesc, fn func([]byte) []byte) error
+}
+
+// MutateFile implements MemFileMutator.
+func (ms *memStorage) MutateFile(fd FileDesc, fn func([]byte) []byte) error {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	m, exist := ms.files[packFile(fd)]
+	if !exist {
+		return os.ErrNotExist
+	}
+	data := append([]byte(nil), m.Bytes()...)
+	m.Reset()
+	_, err := m.Write(fn(data))
+	return err
+}
+
 type memFile struct {
 	bytes.Buffer
 	open bool

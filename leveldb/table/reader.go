@@ -1018,6 +1018,16 @@ func (r *Reader) Release() {
 	r.err = ErrReaderReleased
 }
 
+// Err returns the error that rendered the reader unusable, if any. A nil
+// error means the reader was fully initialized and is healthy. Callers may
+// use this to avoid caching a half-initialized reader created from a
+// corrupted table file.
+func (r *Reader) Err() error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.err
+}
+
 // NewReader creates a new initialized table reader for the file.
 // The fi, cache and bpool is optional and can be nil.
 //

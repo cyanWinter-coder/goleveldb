@@ -554,3 +554,146 @@ func TestLRUCache_Close(t *testing.T) {
 	require.Equal(t, 3, relFuncCalled)
 	require.Equal(t, 1, delFuncCalled)
 }
+
+// countingReleaser records how many times Release was invoked. It models a
+// file handle that must be closed exactly once.
+type countingReleaser struct {
+	releases int32
+}
+
+func (r *countingReleaser) Release() {
+	atomic.AddInt32(&r.releases, 1)
+}
+
+// TestCache_FinalizerIdempotent makes sure the value's Release method runs
+// exactly once even when a forced cache close races with the last external
+// handle being dropped.
+func TestCache_FinalizerIdempotent(t *testing.T) {
+	const iterations = 200
+	for i := 0; i < iterations; i++ {
+		c := NewCache(nil)
+		r := &countingReleaser{}
+
+		// Create a node and keep an outstanding handle on it.
+		h := c.Get(0, 1, func() (int, Value) {
+			return 1, r
+		})
+		require.NotNil(t, h)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		// Forced close while the handle is still alive.
+		go func() {
+			defer wg.Done()
+			c.Close(true)
+		}()
+		// The handle owner releases concurrently.
+		go func() {
+			defer wg.Done()
+			h.Release()
+		}()
+		wg.Wait()
+
+		// Releasing again must be a no-op and never run the finalizer twice.
+		h.Release()
+		require.Equal(t, int32(1), atomic.LoadInt32(&r.releases),
+			"iteration %d: value released more than once", i)
+	}
+}
+
+// TestCache_DeleteThenCloseIdempotent covers the path where a node is
+// deleted with outstanding handles, then the cache is force-closed before
+// (or while) the handles are returned.
+func TestCache_DeleteThenCloseIdempotent(t *testing.T) {
+	const iterations = 200
+	for i := 0; i < iterations; i++ {
+		c := NewCache(nil)
+		r := &countingReleaser{}
+		var delCalls int32
+
+		h := c.Get(0, 1, func() (int, Value) {
+			return 1, r
+		})
+		require.NotNil(t, h)
+
+		// Delete while the handle pins the node; the delete callback must
+		// not fire until the node is finalized.
+		require.True(t, c.Delete(0, 1, func() {
+			atomic.AddInt32(&delCalls, 1)
+		}))
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			c.Close(true)
+		}()
+		go func() {
+			defer wg.Done()
+			h.Release()
+		}()
+		wg.Wait()
+
+		require.Equal(t, int32(1), atomic.LoadInt32(&r.releases),
+			"iteration %d: value released more than once", i)
+		require.Equal(t, int32(1), atomic.LoadInt32(&delCalls),
+			"iteration %d: delete callback must run exactly once", i)
+	}
+}
+
+// TestCache_CloseConcurrent hammer Close against Get/Delete concurrently to
+// shake out races; run with -race. Every worker is bounded so the test always
+// terminates even if Close unblocks operations partway through.
+func TestCache_CloseConcurrent(t *testing.T) {
+	const (
+		workers = 16
+		opsEach = 2000
+	)
+	c := NewCache(NewLRU(64))
+	var wg sync.WaitGroup
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
+			for i := 0; i < opsEach; i++ {
+				key := uint64(r.Intn(128))
+				h := c.Get(0, key, func() (int, Value) {
+					return 1, &countingReleaser{}
+				})
+				if h != nil {
+					if r.Intn(4) == 0 {
+						c.Delete(0, key, nil)
+					}
+					h.Release()
+				}
+			}
+		}(w)
+	}
+
+	// Close concurrently with the running workers. Once the cache is closed
+	// every operation becomes a cheap, lock-protected no-op.
+	c.Close(true)
+	wg.Wait()
+
+	// All operations after close are stable no-ops.
+	require.Nil(t, c.Get(0, 1, func() (int, Value) { return 1, 1 }))
+	require.False(t, c.Delete(0, 1, nil))
+	require.False(t, c.Evict(0, 1))
+	c.Close(true)
+}
+
+// TestCache_NilValueKeepsBalance verifies a setFunc that fails to produce a
+// value leaves no node behind, so repeated failures never accumulate.
+func TestCache_NilValueKeepsBalance(t *testing.T) {
+	c := NewCache(nil)
+	for i := 0; i < 50; i++ {
+		h := c.Get(0, uint64(i), func() (int, Value) {
+			return 0, nil
+		})
+		require.Nil(t, h)
+	}
+	require.Zero(t, c.Nodes())
+	require.Zero(t, c.Size())
+}

@@ -399,10 +399,36 @@ func (t *tOps) createFrom(src iterator.Iterator) (f *tFile, n int, err error) {
 	return
 }
 
+// tableCacheNS returns the file cache namespace for the given file type.
+// Tables are keyed by both file type and file number (type as namespace,
+// number as key) so a stale table that no longer belongs to the current
+// version can never be confused with another descriptor that happens to
+// reuse the same file number.
+func tableCacheNS(fd storage.FileDesc) uint64 {
+	return uint64(fd.Type)
+}
+
+// cachedTable is the value stored in the file cache. It binds the opened
+// table reader to the exact file descriptor (type and number) it was opened
+// for. On a cache hit, callers verify the binding before reusing the reader;
+// a mismatch means the node is a stale table removed from the current
+// version and it must not be reused.
+type cachedTable struct {
+	fd storage.FileDesc
+	tr *table.Reader
+}
+
+// Release implements util.Releaser and closes the underlying table file
+// when the cache drops the node.
+func (c *cachedTable) Release() {
+	c.tr.Release()
+}
+
 // Opens table. It returns a cache handle, which should
 // be released after use.
 func (t *tOps) open(f *tFile) (ch *cache.Handle, err error) {
-	ch = t.fileCache.Get(0, uint64(f.fd.Num), func() (size int, value cache.Value) {
+	ns, key := tableCacheNS(f.fd), uint64(f.fd.Num)
+	ch = t.fileCache.Get(ns, key, func() (size int, value cache.Value) {
 		var r storage.Reader
 		r, err = t.s.stor.Open(f.fd)
 		if err != nil {
@@ -411,7 +437,7 @@ func (t *tOps) open(f *tFile) (ch *cache.Handle, err error) {
 
 		var blockCache *cache.NamespaceGetter
 		if t.blockCache != nil {
-			blockCache = &cache.NamespaceGetter{Cache: t.blockCache, NS: uint64(f.fd.Num)}
+			blockCache = &cache.NamespaceGetter{Cache: t.blockCache, NS: key}
 		}
 
 		var tr *table.Reader
@@ -420,7 +446,16 @@ func (t *tOps) open(f *tFile) (ch *cache.Handle, err error) {
 			_ = r.Close()
 			return 0, nil
 		}
-		return 1, tr
+		// A corrupted table returns a reader carrying the corruption error
+		// rather than a Go error. Don't publish such a half-initialized
+		// reader into the cache; close the file and let the cache drop the
+		// node cleanly, keeping its reference counters balanced.
+		if cerr := tr.Err(); cerr != nil {
+			err = cerr
+			tr.Release()
+			return 0, nil
+		}
+		return 1, &cachedTable{fd: f.fd, tr: tr}
 
 	})
 	if ch == nil && err == nil {
@@ -429,52 +464,76 @@ func (t *tOps) open(f *tFile) (ch *cache.Handle, err error) {
 	return
 }
 
-// Finds key/value pair whose key is greater than or equal to the
-// given key.
-func (t *tOps) find(f *tFile, key []byte, ro *opt.ReadOptions) (rkey, rvalue []byte, err error) {
+// getReader resolves a cache handle to the table reader for f. It verifies
+// that the cached node still describes f; a handle whose identity doesn't
+// match the requested file is released and reported as a miss instead of
+// returning a reader owned by a removed table.
+func (t *tOps) getReader(f *tFile) (*table.Reader, *cache.Handle, error) {
 	ch, err := t.open(f)
 	if err != nil {
 		return nil, nil, err
 	}
+	ct := ch.Value().(*cachedTable)
+	if ct.fd != f.fd {
+		ch.Release()
+		return nil, nil, ErrClosed
+	}
+	return ct.tr, ch, nil
+}
+
+// Finds key/value pair whose key is greater than or equal to the
+// given key.
+func (t *tOps) find(f *tFile, key []byte, ro *opt.ReadOptions) (rkey, rvalue []byte, err error) {
+	tr, ch, err := t.getReader(f)
+	if err != nil {
+		return nil, nil, err
+	}
 	defer ch.Release()
-	return ch.Value().(*table.Reader).Find(key, true, ro)
+	return tr.Find(key, true, ro)
 }
 
 // Finds key that is greater than or equal to the given key.
 func (t *tOps) findKey(f *tFile, key []byte, ro *opt.ReadOptions) (rkey []byte, err error) {
-	ch, err := t.open(f)
+	tr, ch, err := t.getReader(f)
 	if err != nil {
 		return nil, err
 	}
 	defer ch.Release()
-	return ch.Value().(*table.Reader).FindKey(key, true, ro)
+	return tr.FindKey(key, true, ro)
 }
 
 // Returns approximate offset of the given key.
 func (t *tOps) offsetOf(f *tFile, key []byte) (offset int64, err error) {
-	ch, err := t.open(f)
+	tr, ch, err := t.getReader(f)
 	if err != nil {
 		return
 	}
 	defer ch.Release()
-	return ch.Value().(*table.Reader).OffsetOf(key)
+	return tr.OffsetOf(key)
 }
 
-// Creates an iterator from the given table.
+// Creates an iterator from the given table. The returned iterator borrows
+// exactly one cache handle (one reader reference); the handle is attached as
+// the iterator's releaser, so releasing the iterator drops the reference
+// exactly once. The underlying file stays open until that last reference is
+// released and the table is evicted or removed.
 func (t *tOps) newIterator(f *tFile, slice *util.Range, ro *opt.ReadOptions) iterator.Iterator {
-	ch, err := t.open(f)
+	tr, ch, err := t.getReader(f)
 	if err != nil {
 		return iterator.NewEmptyIterator(err)
 	}
-	iter := ch.Value().(*table.Reader).NewIterator(slice, ro)
+	iter := tr.NewIterator(slice, ro)
+	// Transfer ownership of the single borrowed handle to the iterator.
 	iter.SetReleaser(ch)
 	return iter
 }
 
-// Removes table from persistent storage. It waits until
-// no one use the the table.
+// Removes table from persistent storage. The cache node is banned and
+// detached from visibility first; the actual file removal only runs inside
+// the cache delete callback once every outstanding handle (iterators and
+// point lookups) has released its reference.
 func (t *tOps) remove(fd storage.FileDesc) {
-	t.fileCache.Delete(0, uint64(fd.Num), func() {
+	t.fileCache.Delete(tableCacheNS(fd), uint64(fd.Num), func() {
 		if err := t.s.stor.Remove(fd); err != nil {
 			t.s.logf("table@remove removing @%d %q", fd.Num, err)
 		} else {

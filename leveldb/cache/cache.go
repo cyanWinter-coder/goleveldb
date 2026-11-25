@@ -208,14 +208,10 @@ func (b *mBucket) delete(r *Cache, h *mHead, hash uint32, ns, key uint64) (done,
 		if atomic.LoadInt32(&n.ref) == 0 {
 			deleted = true
 
-			// Save and clear value.
-			if n.value != nil {
-				// Call releaser.
-				if r, ok := n.value.(util.Releaser); ok {
-					r.Release()
-				}
-				n.value = nil
-			}
+			// Run the value releaser (file close) while holding the bucket
+			// lock, exactly as the original implementation did. The CAS
+			// inside makes it idempotent against a racing forced close.
+			n.releaseValue()
 
 			// Remove node from bucket.
 			b.nodes = append(b.nodes[:i], b.nodes[i+1:]...)
@@ -225,10 +221,11 @@ func (b *mBucket) delete(r *Cache, h *mHead, hash uint32, ns, key uint64) (done,
 	b.mu.Unlock()
 
 	if deleted {
-		// Call delete funcs.
-		for _, f := range n.delFuncs {
-			f()
-		}
+		// The delete callbacks (e.g. physical file removal) must run without
+		// holding the bucket lock, since they may re-enter the storage layer.
+		// The CAS makes the callbacks run exactly once even if a forced close
+		// races this deletion.
+		n.runDeleteFuncs()
 
 		// Update counter.
 		atomic.AddInt64(&r.statSize, int64(n.size)*-1)
@@ -680,6 +677,13 @@ type Node struct {
 	size  int
 	value Value
 
+	// valueFinalized and delFuncsFinalized make the two finalizer stages
+	// idempotent. The value releaser (e.g. file close) and the delete
+	// callbacks each run exactly once, even when reference release and a
+	// forced cache close race each other.
+	valueFinalized    int32
+	delFuncsFinalized int32
+
 	ref      int32
 	delFuncs []func()
 
@@ -719,20 +723,37 @@ func (n *Node) GetHandle() *Handle {
 	return &Handle{unsafe.Pointer(n)}
 }
 
-func (n *Node) callFinalizer() {
-	// Call releaser.
+// releaseValue closes the cached value exactly once. It is safe to call
+// concurrently; only the winning caller runs the value's Release method.
+func (n *Node) releaseValue() {
+	if !atomic.CompareAndSwapInt32(&n.valueFinalized, 0, 1) {
+		return
+	}
 	if n.value != nil {
 		if r, ok := n.value.(util.Releaser); ok {
 			r.Release()
 		}
 		n.value = nil
 	}
+}
 
-	// Call delete funcs.
+// runDeleteFuncs executes the node's delete callbacks exactly once. It must
+// be called without holding a bucket lock.
+func (n *Node) runDeleteFuncs() {
+	if !atomic.CompareAndSwapInt32(&n.delFuncsFinalized, 0, 1) {
+		return
+	}
 	for _, f := range n.delFuncs {
 		f()
 	}
 	n.delFuncs = nil
+}
+
+// callFinalizer runs both finalizer stages. Used by the forced close path,
+// which is not holding a bucket lock.
+func (n *Node) callFinalizer() {
+	n.releaseValue()
+	n.runDeleteFuncs()
 }
 
 func (n *Node) unRefInternal(updateStat bool) {

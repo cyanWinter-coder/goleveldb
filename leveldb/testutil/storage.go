@@ -679,6 +679,14 @@ func NewStorage() *Storage {
 	} else {
 		stor = storage.NewMemStorage()
 	}
+	return NewStorageWith(stor, path)
+}
+
+// NewStorageWith wraps the given underlying storage with the test
+// instrumentation (open-file tracking, error emulation and logging). The
+// path is only used for filesystem-backed storage cleanup and may be empty
+// for in-memory storage.
+func NewStorageWith(stor storage.Storage, path string) *Storage {
 	s := &Storage{
 		Storage: stor,
 		path:    path,
